@@ -2,9 +2,10 @@
 
 [![](https://github.com/yhirose/cpp-httplib/workflows/test/badge.svg)](https://github.com/yhirose/cpp-httplib/actions)
 
-A C++11 single-file header-only cross platform HTTP/HTTPS library.
+A C++11 single-file header-only cross platform HTTP/HTTPS library.<br>
+It's extremely easy to set up. Just include the **[httplib.h](https://raw.githubusercontent.com/yhirose/cpp-httplib/refs/heads/master/httplib.h)** file in your code!
 
-It's extremely easy to set up. Just include the **httplib.h** file in your code!
+**Learn more in the [official documentation](https://yhirose.github.io/cpp-httplib/)**.
 
 > [!IMPORTANT]
 > This library uses 'blocking' socket I/O. If you are looking for a library with 'non-blocking' socket I/O, this is not the one that you want.
@@ -12,7 +13,7 @@ It's extremely easy to set up. Just include the **httplib.h** file in your code!
 ## Main Features
 
 - HTTP Server/Client
-- SSL/TLS support (OpenSSL, MbedTLS)
+- SSL/TLS support (OpenSSL, MbedTLS, wolfSSL)
 - [Stream API](README-stream.md)
 - [Server-Sent Events](README-sse.md)
 - [WebSocket](README-websocket.md)
@@ -64,6 +65,7 @@ cpp-httplib supports multiple TLS backends through an abstraction layer:
 | :------ | :----- | :-------- |
 | OpenSSL | `CPPHTTPLIB_OPENSSL_SUPPORT` | `libssl`, `libcrypto` |
 | Mbed TLS | `CPPHTTPLIB_MBEDTLS_SUPPORT` | `libmbedtls`, `libmbedx509`, `libmbedcrypto` |
+| wolfSSL | `CPPHTTPLIB_WOLFSSL_SUPPORT` | `libwolfssl` |
 
 > [!NOTE]
 > OpenSSL 3.0 or later is required. Please see [this page](https://www.openssl.org/policies/releasestrat.html) for more information.
@@ -71,12 +73,18 @@ cpp-httplib supports multiple TLS backends through an abstraction layer:
 > [!NOTE]
 > Mbed TLS 2.x and 3.x are supported. The library automatically detects the version and uses the appropriate API.
 
+> [!NOTE]
+> wolfSSL must be built with OpenSSL compatibility layer enabled (`--enable-opensslall`). wolfSSL 5.x is supported.
+
+> [!NOTE]
+> **Mbed TLS / wolfSSL limitation:** `get_ca_certs()` and `get_ca_names()` only reflect CA certificates loaded via `load_ca_cert_store()` or `load_ca_cert_store(pem, size)`. Certificates loaded through `set_ca_cert_path()` or system certificates (`load_system_certs`) are not enumerable with these backends.
+
 > [!TIP]
-> For macOS: cpp-httplib can use system certs with `CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN`. `CoreFoundation` and `Security` should be linked with `-framework`.
+> For macOS: cpp-httplib automatically loads system certs from the Keychain when a TLS backend is enabled. `CoreFoundation` and `Security` must be linked with `-framework`. To disable this, define `CPPHTTPLIB_DISABLE_MACOSX_AUTOMATIC_ROOT_CERTIFICATES`.
 
 ```c++
-// Use either OpenSSL or Mbed TLS
-#define CPPHTTPLIB_OPENSSL_SUPPORT   // or CPPHTTPLIB_MBEDTLS_SUPPORT
+// Use either OpenSSL, Mbed TLS, or wolfSSL
+#define CPPHTTPLIB_OPENSSL_SUPPORT   // or CPPHTTPLIB_MBEDTLS_SUPPORT or CPPHTTPLIB_WOLFSSL_SUPPORT
 #include "path/to/httplib.h"
 
 // Server
@@ -102,10 +110,10 @@ cli.enable_server_hostname_verification(false);
 When SSL operations fail, cpp-httplib provides detailed error information through `ssl_error()` and `ssl_backend_error()`:
 
 - `ssl_error()` - Returns the TLS-level error code (e.g., `SSL_ERROR_SSL` for OpenSSL)
-- `ssl_backend_error()` - Returns the backend-specific error code (e.g., `ERR_get_error()` for OpenSSL, return value for Mbed TLS)
+- `ssl_backend_error()` - Returns the backend-specific error code (e.g., `ERR_get_error()` for OpenSSL/wolfSSL, return value for Mbed TLS)
 
 ```c++
-#define CPPHTTPLIB_OPENSSL_SUPPORT  // or CPPHTTPLIB_MBEDTLS_SUPPORT
+#define CPPHTTPLIB_OPENSSL_SUPPORT  // or CPPHTTPLIB_MBEDTLS_SUPPORT or CPPHTTPLIB_WOLFSSL_SUPPORT
 #include "path/to/httplib.h"
 
 httplib::Client cli("https://example.com");
@@ -188,7 +196,7 @@ svr.Get("/", [](const httplib::Request &req, httplib::Response &res) {
 
 ### Windows Certificate Verification
 
-On Windows, cpp-httplib automatically performs additional certificate verification using the Windows certificate store via CryptoAPI (`CertGetCertificateChain` / `CertVerifyCertificateChainPolicy`). This works with both OpenSSL and Mbed TLS backends, providing:
+On Windows, cpp-httplib automatically performs additional certificate verification using the Windows certificate store via CryptoAPI (`CertGetCertificateChain` / `CertVerifyCertificateChainPolicy`). This works with all TLS backends (OpenSSL, Mbed TLS, and wolfSSL), providing:
 
 - Real-time certificate validation integrated with Windows Update
 - Certificate revocation checking
@@ -197,7 +205,7 @@ On Windows, cpp-httplib automatically performs additional certificate verificati
 This feature is enabled by default and can be controlled at runtime:
 
 ```c++
-// Disable Windows certificate verification (use only OpenSSL/Mbed TLS verification)
+// Disable Windows certificate verification (use only OpenSSL/Mbed TLS/wolfSSL verification)
 cli.enable_windows_certificate_verification(false);
 ```
 
@@ -461,6 +469,34 @@ svr.set_pre_request_handler([](const auto& req, auto& res) {
 });
 ```
 
+### Response user data
+
+`res.user_data` is a `std::map<std::string, httplib::any>` that lets pre-routing or pre-request handlers pass arbitrary data to route handlers.
+
+```cpp
+struct AuthContext {
+  std::string user_id;
+  std::string role;
+};
+
+svr.set_pre_routing_handler([](const auto& req, auto& res) {
+  auto token = req.get_header_value("Authorization");
+  res.user_data["auth"] = AuthContext{decode_token(token)};
+  return Server::HandlerResponse::Unhandled;
+});
+
+svr.Get("/me", [](const auto& /*req*/, auto& res) {
+  auto* ctx = httplib::any_cast<AuthContext>(&res.user_data["auth"]);
+  if (!ctx) {
+    res.status = StatusCode::Unauthorized_401;
+    return;
+  }
+  res.set_content("Hello " + ctx->user_id, "text/plain");
+});
+```
+
+`httplib::any` mirrors the C++17 `std::any` API. On C++17 and later it is an alias for `std::any`; on C++11/14 a compatible implementation is provided.
+
 ### Form data handling
 
 #### URL-encoded form data ('application/x-www-form-urlencoded')
@@ -501,8 +537,17 @@ svr.Post("/multipart", [&](const Request& req, Response& res) {
       std::cout << "Header: " << header.first << " = " << header.second << std::endl;
     }
 
+    // IMPORTANT: file.filename is an untrusted value from the client.
+    // Always extract only the basename to prevent path traversal attacks.
+    auto safe_name = std::filesystem::path(file.filename).filename();
+    if (safe_name.empty() || safe_name == "." || safe_name == "..") {
+      res.status = StatusCode::BadRequest_400;
+      res.set_content("Invalid filename", "text/plain");
+      return;
+    }
+
     // Save to disk
-    std::ofstream ofs(file.filename, std::ios::binary);
+    std::ofstream ofs(upload_dir / safe_name, std::ios::binary);
     ofs << file.content;
   }
 
@@ -952,6 +997,26 @@ httplib::UploadFormDataItems items = {
 };
 
 auto res = cli.Post("/multipart", items);
+```
+
+To upload files from disk without loading them entirely into memory, use `make_file_provider`. The file is sent with chunked transfer encoding.
+
+```cpp
+httplib::FormDataProviderItems providers = {
+  httplib::make_file_provider("file1", "/path/to/large.bin", "large.bin", "application/octet-stream"),
+  httplib::make_file_provider("avatar", "/path/to/photo.jpg", "photo.jpg", "image/jpeg"),
+};
+
+auto res = cli.Post("/upload", {}, {}, providers);
+```
+
+### POST with a file body
+
+To POST a file as a raw binary body with `Content-Length`, use `make_file_body`.
+
+```cpp
+auto [size, provider] = httplib::make_file_body("/path/to/data.bin");
+auto res = cli.Post("/upload", size, provider, "application/octet-stream");
 ```
 
 ### PUT

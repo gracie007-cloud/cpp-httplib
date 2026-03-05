@@ -323,9 +323,10 @@ TEST(SocketStream, wait_writable_UNIX) {
   asSocketStream(fds[0], [&](Stream &s0) {
     EXPECT_EQ(s0.socket(), fds[0]);
     EXPECT_TRUE(s0.wait_writable());
+    EXPECT_TRUE(s0.is_peer_alive());
 
     EXPECT_EQ(0, close(fds[1]));
-    EXPECT_FALSE(s0.wait_writable());
+    EXPECT_FALSE(s0.is_peer_alive());
 
     return true;
   });
@@ -367,7 +368,9 @@ TEST(SocketStream, wait_writable_INET) {
   };
   asSocketStream(disconnected_svr_sock, [&](Stream &ss) {
     EXPECT_EQ(ss.socket(), disconnected_svr_sock);
-    EXPECT_FALSE(ss.wait_writable());
+    // wait_writable() returns true because select_write() only checks if the
+    // send buffer has space. Peer disconnection is detected later by send().
+    EXPECT_TRUE(ss.wait_writable());
 
     return true;
   });
@@ -2698,16 +2701,14 @@ TEST(ExceptionTest, WithoutExceptionHandler) {
     auto res = cli.Get("/exception");
     ASSERT_TRUE(res);
     EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
-    ASSERT_TRUE(res->has_header("EXCEPTION_WHAT"));
-    EXPECT_EQ("exception...", res->get_header_value("EXCEPTION_WHAT"));
+    EXPECT_FALSE(res->has_header("EXCEPTION_WHAT"));
   }
 
   {
     auto res = cli.Get("/unknown");
     ASSERT_TRUE(res);
     EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
-    ASSERT_TRUE(res->has_header("EXCEPTION_WHAT"));
-    EXPECT_EQ("exception\\r\\n...", res->get_header_value("EXCEPTION_WHAT"));
+    EXPECT_FALSE(res->has_header("EXCEPTION_WHAT"));
   }
 }
 
@@ -2998,6 +2999,115 @@ TEST(RequestHandlerTest, PreRequestHandler) {
     EXPECT_EQ(StatusCode::Forbidden_403, res->status);
     EXPECT_EQ("error", res->body);
   }
+}
+
+TEST(AnyTest, BasicOperations) {
+  // Default construction
+  httplib::any a;
+  EXPECT_FALSE(a.has_value());
+
+  // Value construction and any_cast (pointer form, noexcept)
+  httplib::any b(42);
+  EXPECT_TRUE(b.has_value());
+  auto *p = httplib::any_cast<int>(&b);
+  ASSERT_NE(nullptr, p);
+  EXPECT_EQ(42, *p);
+
+  // Type mismatch → nullptr
+  auto *q = httplib::any_cast<std::string>(&b);
+  EXPECT_EQ(nullptr, q);
+
+  // any_cast (value form) succeeds
+  EXPECT_EQ(42, httplib::any_cast<int>(b));
+
+  // any_cast (value form) throws on type mismatch
+#ifndef CPPHTTPLIB_NO_EXCEPTIONS
+  EXPECT_THROW(httplib::any_cast<std::string>(b), httplib::bad_any_cast);
+#endif
+
+  // Copy
+  httplib::any c = b;
+  EXPECT_EQ(42, httplib::any_cast<int>(c));
+
+  // Move
+  httplib::any d = std::move(c);
+  EXPECT_EQ(42, httplib::any_cast<int>(d));
+
+  // Assignment with different type
+  b = std::string("hello");
+  EXPECT_EQ("hello", httplib::any_cast<std::string>(b));
+
+  // Reset
+  b.reset();
+  EXPECT_FALSE(b.has_value());
+}
+
+TEST(RequestHandlerTest, ResponseUserDataInPreRouting) {
+  struct AuthCtx {
+    std::string user_id;
+  };
+
+  Server svr;
+
+  svr.set_pre_routing_handler([](const Request & /*req*/, Response &res) {
+    res.user_data["auth"] = AuthCtx{"alice"};
+    return Server::HandlerResponse::Unhandled;
+  });
+
+  svr.Get("/me", [](const Request & /*req*/, Response &res) {
+    auto *ctx = httplib::any_cast<AuthCtx>(&res.user_data["auth"]);
+    ASSERT_NE(nullptr, ctx);
+    res.set_content("Hello " + ctx->user_id, "text/plain");
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  auto res = cli.Get("/me");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("Hello alice", res->body);
+}
+
+TEST(RequestHandlerTest, ResponseUserDataInPreRequest) {
+  struct RoleCtx {
+    std::string role;
+  };
+
+  Server svr;
+
+  svr.set_pre_request_handler([](const Request & /*req*/, Response &res) {
+    res.user_data["role"] = RoleCtx{"admin"};
+    return Server::HandlerResponse::Unhandled;
+  });
+
+  svr.Get("/role", [](const Request & /*req*/, Response &res) {
+    auto *ctx = httplib::any_cast<RoleCtx>(&res.user_data["role"]);
+    ASSERT_NE(nullptr, ctx);
+    res.set_content(ctx->role, "text/plain");
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  auto res = cli.Get("/role");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("admin", res->body);
 }
 
 TEST(InvalidFormatTest, StatusCode) {
@@ -3776,6 +3886,13 @@ protected:
                    "12345678901234567890123456789012345678901234567890123456789"
                    "01234567890123456789012345678901234567890",
                    "text/plain");
+             })
+        .Get("/compress-with-charset",
+             [&](const Request & /*req*/, Response &res) {
+               res.set_content(
+                   "12345678901234567890123456789012345678901234567890123456789"
+                   "01234567890123456789012345678901234567890",
+                   "application/json; charset=utf-8");
              })
         .Get("/nocompress",
              [&](const Request & /*req*/, Response &res) {
@@ -4693,12 +4810,9 @@ TEST_F(ServerTest, HeaderCountSecurityTest) {
   if (res) {
     // If we get a response, it should be 400 Bad Request
     EXPECT_EQ(StatusCode::BadRequest_400, res->status);
-  } else {
-    // Request failed, which is the expected behavior for DoS protection
-    EXPECT_FALSE(res);
+    EXPECT_EQ("close", res->get_header_value("Connection"));
   }
 
-  EXPECT_EQ("close", res->get_header_value("Connection"));
   EXPECT_FALSE(cli_.is_socket_open());
 }
 
@@ -6134,6 +6248,21 @@ TEST_F(ServerTest, Gzip) {
   EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("33", res->get_header_value("Content-Length"));
+  EXPECT_EQ("123456789012345678901234567890123456789012345678901234567890123456"
+            "7890123456789012345678901234567890",
+            res->body);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST_F(ServerTest, GzipWithContentTypeParameters) {
+  Headers headers;
+  headers.emplace("Accept-Encoding", "gzip, deflate");
+  auto res = cli_.Get("/compress-with-charset", headers);
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_EQ("application/json; charset=utf-8",
+            res->get_header_value("Content-Type"));
   EXPECT_EQ("123456789012345678901234567890123456789012345678901234567890123456"
             "7890123456789012345678901234567890",
             res->body);
@@ -8541,6 +8670,68 @@ TEST_F(LargePayloadMaxLengthTest, NoContentLengthExceeds10MB) {
     }
   }
 }
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+// `payload_max_length` is not enforced on decompressed body in ContentReader
+// path.
+TEST(PayloadLimitBypassTest, StreamingGzipDecompression) {
+  Server svr;
+  const size_t LIMIT = 64 * 1024; // 64KB
+  svr.set_payload_max_length(LIMIT);
+
+  size_t total = 0;
+  svr.Post("/stream", [&](const Request & /*req*/, Response &res,
+                          const ContentReader &content_reader) {
+    content_reader([&](const char * /*data*/, size_t len) {
+      total += len;
+      return true;
+    });
+    res.status = 200;
+    res.set_content("stream_ok", "text/plain");
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // Prepare 256KB raw data and gzip-compress it
+  std::string raw(256 * 1024, 'A');
+  std::string gz;
+  {
+    z_stream zs{};
+    deflateInit2(&zs, Z_BEST_COMPRESSION, Z_DEFLATED, 15 + 16, 8,
+                 Z_DEFAULT_STRATEGY);
+    zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(raw.data()));
+    zs.avail_in = static_cast<uInt>(raw.size());
+    char outbuf[4096];
+    int ret;
+    do {
+      zs.next_out = reinterpret_cast<Bytef *>(outbuf);
+      zs.avail_out = sizeof(outbuf);
+      ret = deflate(&zs, Z_FINISH);
+      gz.append(outbuf, sizeof(outbuf) - zs.avail_out);
+    } while (ret != Z_STREAM_END);
+    deflateEnd(&zs);
+  }
+
+  Client cli(HOST, PORT);
+  cli.set_connection_timeout(std::chrono::seconds(5));
+  Headers headers = {{"Content-Encoding", "gzip"}};
+  auto res = cli.Post("/stream", headers, gz.data(), gz.size(),
+                      "application/octet-stream");
+  ASSERT_TRUE(res);
+
+  // Server must reject oversized decompressed payloads with 413.
+  EXPECT_EQ(StatusCode::PayloadTooLarge_413, res->status);
+
+  // Decompressed bytes delivered to the handler must not exceed LIMIT.
+  EXPECT_LE(total, LIMIT);
+}
+#endif
 
 // Regression test for DoS vulnerability: a malicious server sending a response
 // without Content-Length header must not cause unbounded memory consumption on
@@ -11418,6 +11609,55 @@ TEST(MultipartFormDataTest, AlternateFilename) {
   ASSERT_TRUE(send_request(1, req));
 }
 
+TEST(MultipartFormDataTest, AlternateFilenameLongValueAndCaseInsensitive) {
+  auto handled = false;
+
+  Server svr;
+  svr.Post("/test", [&](const Request &req, Response &res) {
+    // Case-insensitive "utf-8''" prefix with a long value
+    const auto &file = req.form.get_file("file1");
+    ASSERT_EQ("file1", file.name);
+    // 8000 chars exercises both the Content-Disposition parser and the
+    // filename* parser near the CPPHTTPLIB_HEADER_MAX_LENGTH limit (8192).
+    // Prior to the fix, std::regex_match on this header would cause O(N)
+    // stack recursion in libstdc++, leading to SIGSEGV.
+    std::string expected_filename(8000, 'A');
+    ASSERT_EQ(expected_filename, file.filename);
+
+    res.set_content("ok", "text/plain");
+    handled = true;
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+    ASSERT_TRUE(handled);
+  });
+
+  svr.wait_until_ready();
+
+  // Build body with a long filename* value using mixed-case prefix "Utf-8''"
+  // Regression test for GHSA-qq6v-r583-3h69
+  std::string long_filename(8000, 'A');
+  std::string body = "----------\r\n"
+                     "Content-Disposition: form-data; name=\"file1\"; "
+                     "filename*=\"Utf-8''" +
+                     long_filename +
+                     "\"\r\n"
+                     "\r\n"
+                     "hello\r\n"
+                     "------------\r\n";
+
+  auto req = "POST /test HTTP/1.1\r\n"
+             "Content-Type: multipart/form-data;boundary=--------\r\n"
+             "Content-Length: " +
+             std::to_string(body.size()) + "\r\n\r\n" + body;
+
+  ASSERT_TRUE(send_request(1, req));
+}
+
 TEST(MultipartFormDataTest, CloseDelimiterWithoutCRLF) {
   auto handled = false;
 
@@ -11616,6 +11856,140 @@ TEST(MultipartFormDataTest, LargeHeader) {
   std::string response;
   ASSERT_TRUE(send_request(1, req, &response));
   ASSERT_EQ("200", response.substr(9, 3));
+}
+
+TEST(MultipartFormDataTest, UploadItemsHasContentLength) {
+  // Verify that Post(path, headers, UploadFormDataItems) sends Content-Length
+  // (not chunked Transfer-Encoding) after the streaming refactor.
+  auto handled = false;
+
+  Server svr;
+  svr.Post("/upload", [&](const Request &req, Response &res) {
+    auto cl_it = req.headers.find("Content-Length");
+    EXPECT_TRUE(cl_it != req.headers.end());
+    auto te_it = req.headers.find("Transfer-Encoding");
+    EXPECT_TRUE(te_it == req.headers.end());
+    EXPECT_EQ(2u, req.form.fields.size() + req.form.files.size());
+    res.set_content("ok", "text/plain");
+    handled = true;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+    ASSERT_TRUE(handled);
+  });
+
+  svr.wait_until_ready();
+
+  UploadFormDataItems items = {
+      {"field1", "hello", "", "text/plain"},
+      {"file1", "world", "test.txt", "application/octet-stream"},
+  };
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/upload", {}, items);
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST(MultipartFormDataTest, MakeFileProvider) {
+  // Verify make_file_provider sends a file's contents correctly.
+  const std::string file_content(4096, 'Z');
+  const std::string tmp_path = "/tmp/httplib_test_make_file_provider.bin";
+  {
+    std::ofstream ofs(tmp_path, std::ios::binary);
+    ofs.write(file_content.data(),
+              static_cast<std::streamsize>(file_content.size()));
+  }
+
+  auto handled = false;
+
+  Server svr;
+  svr.Post("/upload", [&](const Request &req, Response & /*res*/,
+                          const ContentReader &content_reader) {
+    ASSERT_TRUE(req.is_multipart_form_data());
+    std::vector<FormData> items;
+    content_reader(
+        [&](const FormData &file) {
+          items.push_back(file);
+          return true;
+        },
+        [&](const char *data, size_t data_length) {
+          items.back().content.append(data, data_length);
+          return true;
+        });
+    ASSERT_EQ(1u, items.size());
+    EXPECT_EQ("myfile", items[0].name);
+    EXPECT_EQ("data.bin", items[0].filename);
+    EXPECT_EQ("application/octet-stream", items[0].content_type);
+    EXPECT_EQ(file_content, items[0].content);
+    handled = true;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+    ASSERT_TRUE(handled);
+    std::remove(tmp_path.c_str());
+  });
+
+  svr.wait_until_ready();
+
+  FormDataProviderItems providers;
+  providers.push_back(make_file_provider("myfile", tmp_path, "data.bin",
+                                         "application/octet-stream"));
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/upload", {}, {}, providers);
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST(MakeFileBodyTest, Basic) {
+  const std::string file_content(4096, 'Z');
+  const std::string tmp_path = "/tmp/httplib_test_make_file_body.bin";
+  {
+    std::ofstream ofs(tmp_path, std::ios::binary);
+    ofs.write(file_content.data(),
+              static_cast<std::streamsize>(file_content.size()));
+  }
+
+  auto handled = false;
+
+  Server svr;
+  svr.Post("/upload", [&](const Request &req, Response &res) {
+    EXPECT_EQ(file_content, req.body);
+    handled = true;
+    res.status = StatusCode::OK_200;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+    ASSERT_TRUE(handled);
+    std::remove(tmp_path.c_str());
+  });
+
+  svr.wait_until_ready();
+
+  auto fb = make_file_body(tmp_path);
+  ASSERT_GT(fb.first, 0u);
+
+  Client cli(HOST, port);
+  auto res =
+      cli.Post("/upload", fb.first, fb.second, "application/octet-stream");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST(TaskQueueTest, IncreaseAtomicInteger) {
@@ -15417,7 +15791,7 @@ TEST(ZipBombProtectionTest, DecompressedSizeExceedsLimit) {
 
   // Server should reject because decompressed size (8KB) exceeds limit (1KB)
   ASSERT_TRUE(res);
-  EXPECT_EQ(StatusCode::BadRequest_400, res->status);
+  EXPECT_EQ(StatusCode::PayloadTooLarge_413, res->status);
 }
 #endif
 
